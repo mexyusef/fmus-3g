@@ -1,503 +1,586 @@
-#include <fmus/sip/sip.hpp>
-#include <fmus/core/logger.hpp>
-
+#include "fmus/sip/transaction.hpp"
+#include "fmus/sip/dialog.hpp"
+#include "fmus/core/logger.hpp"
 #include <sstream>
+#include <random>
+#include <iomanip>
 #include <algorithm>
-#include <chrono>
 
 namespace fmus::sip {
 
-// SIP Transaction implementation
-
-SipTransaction::SipTransaction(SipTransactionType type, const std::string& branch, SipMethod method)
-    : type_(type),
-      branch_(branch),
-      method_(method),
-      state_(type == SipTransactionType::Client ?
-            SipTransactionState::Trying :
-            SipTransactionState::Proceeding),
-      created_at_(std::chrono::steady_clock::now()),
-      last_activity_(created_at_) {}
-
-SipTransactionType SipTransaction::getType() const {
-    return type_;
+// Transaction base class implementation
+Transaction::Transaction(TransactionType type, const std::string& transaction_id)
+    : type_(type), transaction_id_(transaction_id), state_(TransactionState::TRYING) {
 }
 
-std::string SipTransaction::getBranch() const {
-    return branch_;
+Transaction::~Transaction() {
+    stopAllTimers();
 }
 
-SipMethod SipTransaction::getMethod() const {
-    return method_;
+void Transaction::setState(TransactionState new_state) {
+    TransactionState old_state = state_.exchange(new_state);
+    if (old_state != new_state) {
+        notifyStateChange(old_state);
+        core::Logger::debug("Transaction {} state changed: {} -> {}", 
+                           transaction_id_, static_cast<int>(old_state), static_cast<int>(new_state));
+    }
 }
 
-SipTransactionState SipTransaction::getState() const {
-    return state_;
+void Transaction::startTimer(const std::string& timer_name, std::chrono::milliseconds duration) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // Stop existing timer with same name
+    stopTimer(timer_name);
+    
+    Timer timer;
+    timer.name = timer_name;
+    timer.duration = duration;
+    timer.expiry = std::chrono::steady_clock::now() + duration;
+    timer.active = true;
+    
+    timers_.push_back(timer);
+    
+    core::Logger::debug("Started timer {} for transaction {} ({}ms)", 
+                       timer_name, transaction_id_, duration.count());
 }
 
-void SipTransaction::setState(SipTransactionState state) {
-    // Menyimpan state sebelumnya untuk acara logging
-    SipTransactionState old_state = state_;
-    state_ = state;
-
-    // Update timestamp last_activity_ saat state berubah
-    last_activity_ = std::chrono::steady_clock::now();
-
-    // Log state change
-    core::Logger::debug("SIP Transaction {} state changed: {} -> {}",
-                     branch_,
-                     stateToString(old_state),
-                     stateToString(state_));
-
-    // Emit state change event
-    events_.emit("stateChanged", state_);
+void Transaction::stopTimer(const std::string& timer_name) {
+    auto it = std::find_if(timers_.begin(), timers_.end(),
+                          [&timer_name](const Timer& t) { return t.name == timer_name; });
+    if (it != timers_.end()) {
+        it->active = false;
+        core::Logger::debug("Stopped timer {} for transaction {}", timer_name, transaction_id_);
+    }
 }
 
-std::chrono::steady_clock::time_point SipTransaction::getCreatedAt() const {
-    return created_at_;
+void Transaction::stopAllTimers() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& timer : timers_) {
+        timer.active = false;
+    }
+    timers_.clear();
 }
 
-std::chrono::steady_clock::time_point SipTransaction::getLastActivity() const {
-    return last_activity_;
-}
-
-core::EventEmitter<SipTransactionEvents>& SipTransaction::events() {
-    return events_;
-}
-
-const SipMessage& SipTransaction::getRequest() const {
-    return request_;
-}
-
-const SipMessage& SipTransaction::getLastResponse() const {
-    return last_response_;
-}
-
-bool SipTransaction::isCompleted() const {
-    return state_ == SipTransactionState::Completed ||
-           state_ == SipTransactionState::Terminated;
-}
-
-bool SipTransaction::isTerminated() const {
-    return state_ == SipTransactionState::Terminated;
-}
-
-bool SipTransaction::isInvite() const {
-    return method_ == SipMethod::INVITE;
-}
-
-bool SipTransaction::isClientTransaction() const {
-    return type_ == SipTransactionType::Client;
-}
-
-bool SipTransaction::isServerTransaction() const {
-    return type_ == SipTransactionType::Server;
-}
-
-void SipTransaction::processRequest(const SipMessage& request) {
-    // Menyimpan referensi ke request
-    request_ = request;
-
-    // Update timestamp last_activity_
-    last_activity_ = std::chrono::steady_clock::now();
-
-    if (type_ == SipTransactionType::Server) {
-        if (state_ == SipTransactionState::Trying) {
-            // Ini adalah request pertama - transisi ke Proceeding
-            setState(SipTransactionState::Proceeding);
-        } else if (state_ == SipTransactionState::Proceeding) {
-            // Ini adalah retransmission - tetap di Proceeding
-            // Tidak perlu mengubah state
-        } else {
-            // Tidak valid untuk menerima request di state lain untuk server transaction
-            core::Logger::warn("Server transaction {} received request in invalid state {}",
-                           branch_, stateToString(state_));
+void Transaction::checkTimers() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto now = std::chrono::steady_clock::now();
+    
+    for (auto& timer : timers_) {
+        if (timer.active && now >= timer.expiry) {
+            timer.active = false;
+            core::Logger::debug("Timer {} expired for transaction {}", timer.name, transaction_id_);
+            notifyTimeout();
         }
+    }
+    
+    // Remove inactive timers
+    timers_.erase(std::remove_if(timers_.begin(), timers_.end(),
+                                [](const Timer& t) { return !t.active; }),
+                 timers_.end());
+}
+
+void Transaction::notifyStateChange(TransactionState old_state) {
+    if (state_callback_) {
+        state_callback_(old_state, state_);
+    }
+}
+
+void Transaction::notifyTimeout() {
+    if (timeout_callback_) {
+        timeout_callback_();
+    }
+}
+
+void Transaction::notifyMessage(const SipMessage& message) {
+    if (message_callback_) {
+        message_callback_(message);
+    }
+}
+
+// ClientInviteTransaction implementation
+ClientInviteTransaction::ClientInviteTransaction(const std::string& transaction_id, const SipMessage& invite)
+    : Transaction(TransactionType::CLIENT_INVITE, transaction_id), invite_(invite) {
+    setState(TransactionState::CALLING);
+}
+
+bool ClientInviteTransaction::processMessage(const SipMessage& message) {
+    if (!canAcceptMessage(message)) {
+        return false;
+    }
+    
+    if (message.isResponse()) {
+        SipResponseCode code = message.getResponseCode();
+        
+        if (code >= SipResponseCode::Trying && code < SipResponseCode::OK) {
+            handleProvisionalResponse(message);
+        } else {
+            handleFinalResponse(message);
+        }
+        
+        return true;
+    }
+    
+    return false;
+}
+
+bool ClientInviteTransaction::sendMessage(const SipMessage& message) {
+    // Client transactions typically don't send messages except INVITE, ACK, CANCEL
+    if (message.getMethod() == SipMethod::INVITE) {
+        return sendInvite();
+    } else if (message.getMethod() == SipMethod::ACK) {
+        return sendAck(last_response_);
+    } else if (message.getMethod() == SipMethod::CANCEL) {
+        return sendCancel();
+    }
+    
+    return false;
+}
+
+bool ClientInviteTransaction::canAcceptMessage(const SipMessage& message) const {
+    if (!message.isResponse()) {
+        return false;
+    }
+    
+    // Check if response matches our INVITE
+    return message.getHeaders().getCallId() == invite_.getHeaders().getCallId() &&
+           message.getHeaders().getCSeq().find("INVITE") != std::string::npos;
+}
+
+bool ClientInviteTransaction::sendInvite() {
+    if (state_ != TransactionState::CALLING) {
+        return false;
+    }
+    
+    startTimerA(); // Retransmission timer
+    startTimerB(); // Transaction timeout
+    
+    notifyMessage(invite_);
+    return true;
+}
+
+bool ClientInviteTransaction::sendAck(const SipMessage& final_response) {
+    if (ack_sent_) {
+        return true; // Already sent
+    }
+    
+    // Create ACK message
+    SipMessage ack(SipMethod::ACK, invite_.getRequestUri());
+    ack.getHeaders().setCallId(invite_.getHeaders().getCallId());
+    ack.getHeaders().setFrom(invite_.getHeaders().getFrom());
+    ack.getHeaders().setTo(final_response.getHeaders().getTo()); // Include To tag from response
+    ack.getHeaders().setCSeq(invite_.getHeaders().getCSeq().substr(0, invite_.getHeaders().getCSeq().find(' ')) + " ACK");
+    ack.getHeaders().setVia(invite_.getHeaders().getVia());
+    
+    ack_sent_ = true;
+    notifyMessage(ack);
+    return true;
+}
+
+bool ClientInviteTransaction::sendCancel() {
+    if (state_ != TransactionState::PROCEEDING) {
+        return false; // Can only cancel after receiving provisional response
+    }
+    
+    // Create CANCEL message
+    SipMessage cancel(SipMethod::CANCEL, invite_.getRequestUri());
+    cancel.getHeaders().setCallId(invite_.getHeaders().getCallId());
+    cancel.getHeaders().setFrom(invite_.getHeaders().getFrom());
+    cancel.getHeaders().setTo(invite_.getHeaders().getTo());
+    cancel.getHeaders().setCSeq(invite_.getHeaders().getCSeq().substr(0, invite_.getHeaders().getCSeq().find(' ')) + " CANCEL");
+    cancel.getHeaders().setVia(invite_.getHeaders().getVia());
+    
+    notifyMessage(cancel);
+    return true;
+}
+
+void ClientInviteTransaction::handleProvisionalResponse(const SipMessage& response) {
+    if (state_ == TransactionState::CALLING) {
+        setState(TransactionState::PROCEEDING);
+        stopTimer("TimerA"); // Stop retransmissions
+    }
+    
+    last_response_ = response;
+    notifyMessage(response);
+}
+
+void ClientInviteTransaction::handleFinalResponse(const SipMessage& response) {
+    setState(TransactionState::COMPLETED);
+    stopTimer("TimerA");
+    stopTimer("TimerB");
+    
+    last_response_ = response;
+    
+    SipResponseCode code = response.getResponseCode();
+    if (code >= SipResponseCode::OK && code < SipResponseCode::MultipleChoices) {
+        // 2xx response - send ACK and terminate immediately
+        sendAck(response);
+        setState(TransactionState::TERMINATED);
     } else {
-        // Client transaction seharusnya tidak menerima request
-        core::Logger::error("Client transaction {} received request - ignoring", branch_);
+        // Error response - send ACK and start Timer D
+        sendAck(response);
+        startTimerD();
+    }
+    
+    notifyMessage(response);
+}
+
+void ClientInviteTransaction::startTimerA() {
+    startTimer("TimerA", std::chrono::milliseconds(500)); // T1 = 500ms
+}
+
+void ClientInviteTransaction::startTimerB() {
+    startTimer("TimerB", std::chrono::seconds(32)); // 64*T1 = 32s
+}
+
+void ClientInviteTransaction::startTimerD() {
+    startTimer("TimerD", std::chrono::seconds(32)); // 32s for UDP, 0 for TCP
+}
+
+// ClientNonInviteTransaction implementation
+ClientNonInviteTransaction::ClientNonInviteTransaction(const std::string& transaction_id, const SipMessage& request)
+    : Transaction(TransactionType::CLIENT_NON_INVITE, transaction_id), request_(request) {
+    setState(TransactionState::TRYING_NON_INVITE);
+}
+
+bool ClientNonInviteTransaction::processMessage(const SipMessage& message) {
+    if (!canAcceptMessage(message)) {
+        return false;
+    }
+    
+    if (message.isResponse()) {
+        SipResponseCode code = message.getResponseCode();
+        
+        if (code >= SipResponseCode::Trying && code < SipResponseCode::OK) {
+            handleProvisionalResponse(message);
+        } else {
+            handleFinalResponse(message);
+        }
+        
+        return true;
+    }
+    
+    return false;
+}
+
+bool ClientNonInviteTransaction::sendMessage(const SipMessage& message) {
+    if (message.getMethod() == request_.getMethod()) {
+        startTimerE(); // Retransmission timer
+        startTimerF(); // Transaction timeout
+        notifyMessage(request_);
+        return true;
+    }
+    
+    return false;
+}
+
+bool ClientNonInviteTransaction::canAcceptMessage(const SipMessage& message) const {
+    if (!message.isResponse()) {
+        return false;
+    }
+    
+    // Check if response matches our request
+    return message.getHeaders().getCallId() == request_.getHeaders().getCallId() &&
+           message.getHeaders().getCSeq() == request_.getHeaders().getCSeq();
+}
+
+void ClientNonInviteTransaction::handleProvisionalResponse(const SipMessage& response) {
+    if (state_ == TransactionState::TRYING_NON_INVITE) {
+        setState(TransactionState::PROCEEDING_NON_INVITE);
+        stopTimer("TimerE"); // Stop retransmissions
+    }
+    
+    notifyMessage(response);
+}
+
+void ClientNonInviteTransaction::handleFinalResponse(const SipMessage& response) {
+    setState(TransactionState::COMPLETED_NON_INVITE);
+    stopTimer("TimerE");
+    stopTimer("TimerF");
+    
+    startTimerK(); // Wait for retransmissions
+    
+    notifyMessage(response);
+}
+
+void ClientNonInviteTransaction::startTimerE() {
+    startTimer("TimerE", std::chrono::milliseconds(500)); // T1 = 500ms
+}
+
+void ClientNonInviteTransaction::startTimerF() {
+    startTimer("TimerF", std::chrono::seconds(32)); // 64*T1 = 32s
+}
+
+void ClientNonInviteTransaction::startTimerK() {
+    startTimer("TimerK", std::chrono::seconds(5)); // T4 = 5s
+}
+
+// ServerInviteTransaction implementation
+ServerInviteTransaction::ServerInviteTransaction(const std::string& transaction_id, const SipMessage& invite)
+    : Transaction(TransactionType::SERVER_INVITE, transaction_id), invite_(invite) {
+    setState(TransactionState::TRYING);
+}
+
+bool ServerInviteTransaction::processMessage(const SipMessage& message) {
+    if (!canAcceptMessage(message)) {
+        return false;
     }
 
-    // Emit request event
-    events_.emit("request", request);
+    if (message.isRequest()) {
+        if (message.getMethod() == SipMethod::ACK) {
+            handleAck(message);
+        } else if (message.getMethod() == SipMethod::CANCEL) {
+            handleCancel(message);
+        } else if (message.getMethod() == SipMethod::INVITE) {
+            // Retransmitted INVITE - resend last response
+            if (!last_response_.getHeaders().getCallId().empty()) {
+                notifyMessage(last_response_);
+            }
+        }
+        return true;
+    }
+
+    return false;
 }
 
-void SipTransaction::processResponse(const SipMessage& response) {
-    // Menyimpan referensi ke response terakhir
+bool ServerInviteTransaction::sendMessage(const SipMessage& message) {
+    if (message.isResponse()) {
+        return sendResponse(message);
+    }
+    return false;
+}
+
+bool ServerInviteTransaction::canAcceptMessage(const SipMessage& message) const {
+    if (!message.isRequest()) {
+        return false;
+    }
+
+    // Check if request matches our INVITE transaction
+    return message.getHeaders().getCallId() == invite_.getHeaders().getCallId() &&
+           (message.getMethod() == SipMethod::INVITE ||
+            message.getMethod() == SipMethod::ACK ||
+            message.getMethod() == SipMethod::CANCEL);
+}
+
+bool ServerInviteTransaction::sendProvisionalResponse(SipResponseCode code, const std::string& reason) {
+    if (final_response_sent_) {
+        return false;
+    }
+
+    SipMessage response(code, reason.empty() ? "" : reason);
+    response.getHeaders().setCallId(invite_.getHeaders().getCallId());
+    response.getHeaders().setFrom(invite_.getHeaders().getFrom());
+    response.getHeaders().setTo(invite_.getHeaders().getTo());
+    response.getHeaders().setCSeq(invite_.getHeaders().getCSeq());
+    response.getHeaders().setVia(invite_.getHeaders().getVia());
+
+    return sendResponse(response);
+}
+
+bool ServerInviteTransaction::sendFinalResponse(SipResponseCode code, const std::string& reason) {
+    SipMessage response(code, reason.empty() ? "" : reason);
+    response.getHeaders().setCallId(invite_.getHeaders().getCallId());
+    response.getHeaders().setFrom(invite_.getHeaders().getFrom());
+    response.getHeaders().setTo(invite_.getHeaders().getTo());
+    response.getHeaders().setCSeq(invite_.getHeaders().getCSeq());
+    response.getHeaders().setVia(invite_.getHeaders().getVia());
+
+    final_response_sent_ = true;
+    return sendResponse(response);
+}
+
+bool ServerInviteTransaction::sendResponse(const SipMessage& response) {
+    if (state_ == TransactionState::TRYING) {
+        setState(TransactionState::PROCEEDING);
+    }
+
     last_response_ = response;
 
-    // Update timestamp last_activity_
-    last_activity_ = std::chrono::steady_clock::now();
-
-    // Get response code
     SipResponseCode code = response.getResponseCode();
-    int code_value = static_cast<int>(code);
+    if (code >= SipResponseCode::OK) {
+        // Final response
+        final_response_sent_ = true;
+        setState(TransactionState::COMPLETED);
 
-    if (type_ == SipTransactionType::Client) {
-        if (isInvite()) {
-            // Client INVITE transaction
-            if (state_ == SipTransactionState::Trying ||
-                state_ == SipTransactionState::Proceeding) {
-
-                if (code_value >= 100 && code_value < 200) {
-                    // Provisional response - transisi ke Proceeding
-                    setState(SipTransactionState::Proceeding);
-                } else if (code_value >= 200 && code_value < 300) {
-                    // 2xx response - transisi ke Terminated
-                    setState(SipTransactionState::Terminated);
-                } else if (code_value >= 300) {
-                    // Final non-2xx response - transisi ke Completed
-                    setState(SipTransactionState::Completed);
-
-                    // Start timer K (untuk RFC3261 compliance) - seharusnya 64*T1 = 32 detik
-                    // Setelah timer K, kita transisi ke Terminated
-                    // Implementasi sederhana: langsung set ke Terminated
-                    setState(SipTransactionState::Terminated);
-                }
-            } else {
-                // Ignore responses in other states
-                core::Logger::debug("Client INVITE transaction {} ignoring response in state {}",
-                               branch_, stateToString(state_));
-            }
-        } else {
-            // Client non-INVITE transaction
-            if (state_ == SipTransactionState::Trying ||
-                state_ == SipTransactionState::Proceeding) {
-
-                if (code_value >= 100 && code_value < 200) {
-                    // Provisional response - transisi ke Proceeding
-                    setState(SipTransactionState::Proceeding);
-                } else if (code_value >= 200) {
-                    // Final response - transisi ke Completed
-                    setState(SipTransactionState::Completed);
-
-                    // Start timer K (untuk RFC3261 compliance) - seharusnya 64*T1 = 32 detik
-                    // Setelah timer K, kita transisi ke Terminated
-                    // Implementasi sederhana: langsung set ke Terminated
-                    setState(SipTransactionState::Terminated);
-                }
-            } else {
-                // Ignore responses in other states
-                core::Logger::debug("Client non-INVITE transaction {} ignoring response in state {}",
-                               branch_, stateToString(state_));
-            }
+        if (code >= SipResponseCode::MultipleChoices) {
+            // Error response - start retransmission timer
+            startTimerG();
+            startTimerH(); // Wait for ACK
         }
-    } else {
-        // Server transactions should not receive responses
-        core::Logger::error("Server transaction {} received response - ignoring", branch_);
+        // For 2xx responses, the transaction terminates immediately
+        // The dialog layer handles ACK for 2xx responses
     }
 
-    // Emit response event
-    events_.emit("response", response);
+    notifyMessage(response);
+    return true;
 }
 
-void SipTransaction::sendRequest(const SipMessage& request) {
-    if (type_ == SipTransactionType::Client) {
-        // Menyimpan referensi ke request
-        request_ = request;
+void ServerInviteTransaction::handleAck(const SipMessage& ack) {
+    if (state_ == TransactionState::COMPLETED) {
+        setState(TransactionState::CONFIRMED);
+        stopTimer("TimerG");
+        stopTimer("TimerH");
+        startTimerI(); // Wait for ACK retransmissions
+    }
 
-        // Update timestamp last_activity_
-        last_activity_ = std::chrono::steady_clock::now();
+    notifyMessage(ack);
+}
 
-        if (state_ == SipTransactionState::Trying) {
-            // Ini adalah request yang pertama kali dikirim
-            // Emit send event
-            events_.emit("send", request);
-        } else {
-            // Retransmission or invalid state
-            core::Logger::warn("Client transaction {} sending request in state {}",
-                          branch_, stateToString(state_));
-            events_.emit("send", request);
+void ServerInviteTransaction::handleCancel(const SipMessage& cancel) {
+    // CANCEL creates its own transaction, but we should notify the application
+    notifyMessage(cancel);
+}
+
+void ServerInviteTransaction::startTimerG() {
+    startTimer("TimerG", std::chrono::milliseconds(500)); // T1 = 500ms
+}
+
+void ServerInviteTransaction::startTimerH() {
+    startTimer("TimerH", std::chrono::seconds(64)); // 64*T1 = 64s
+}
+
+void ServerInviteTransaction::startTimerI() {
+    startTimer("TimerI", std::chrono::seconds(5)); // T4 = 5s
+}
+
+// ServerNonInviteTransaction implementation
+ServerNonInviteTransaction::ServerNonInviteTransaction(const std::string& transaction_id, const SipMessage& request)
+    : Transaction(TransactionType::SERVER_NON_INVITE, transaction_id), request_(request) {
+    setState(TransactionState::TRYING_NON_INVITE);
+}
+
+bool ServerNonInviteTransaction::processMessage(const SipMessage& message) {
+    if (!canAcceptMessage(message)) {
+        return false;
+    }
+
+    if (message.isRequest() && message.getMethod() == request_.getMethod()) {
+        // Retransmitted request - resend last response
+        if (!last_response_.getHeaders().getCallId().empty()) {
+            notifyMessage(last_response_);
         }
-    } else {
-        // Server transactions don't send requests
-        core::Logger::error("Server transaction {} attempted to send request - ignoring", branch_);
-    }
-}
-
-void SipTransaction::sendResponse(const SipMessage& response) {
-    if (type_ == SipTransactionType::Server) {
-        // Menyimpan referensi ke response terakhir
-        last_response_ = response;
-
-        // Update timestamp last_activity_
-        last_activity_ = std::chrono::steady_clock::now();
-
-        // Get response code
-        SipResponseCode code = response.getResponseCode();
-        int code_value = static_cast<int>(code);
-
-        if (isInvite()) {
-            // Server INVITE transaction
-            if (state_ == SipTransactionState::Proceeding) {
-                if (code_value >= 100 && code_value < 200) {
-                    // Tetap di state Proceeding untuk provisional response
-                } else if (code_value >= 200 && code_value < 300) {
-                    // 2xx responses are handled by the TU (Transaction User) layer
-                    // Transaction terminates
-                    setState(SipTransactionState::Terminated);
-                } else if (code_value >= 300) {
-                    // Final non-2xx response - transition to Completed
-                    setState(SipTransactionState::Completed);
-
-                    // Start timer H (for RFC3261 compliance) - typically 64*T1 = 32s
-                    // After timer H, transition to Terminated
-                    // Simple implementation: directly set to Terminated after some delay
-                    // In a real implementation, we would use a timer
-                    setState(SipTransactionState::Terminated);
-                }
-            } else if (state_ == SipTransactionState::Completed) {
-                // Retransmission of the final response
-                // In a real implementation, we would keep the last response
-                // and retransmit it automatically
-            } else {
-                // Invalid state
-                core::Logger::warn("Server INVITE transaction {} sending response in invalid state {}",
-                              branch_, stateToString(state_));
-            }
-        } else {
-            // Server non-INVITE transaction
-            if (state_ == SipTransactionState::Proceeding) {
-                if (code_value >= 100 && code_value < 200) {
-                    // Tetap di state Proceeding untuk provisional response
-                } else if (code_value >= 200) {
-                    // Final response - transition to Completed
-                    setState(SipTransactionState::Completed);
-
-                    // Start timer J (for RFC3261 compliance) - typically 64*T1 = 32s
-                    // After timer J, transition to Terminated
-                    // Simple implementation: directly set to Terminated
-                    setState(SipTransactionState::Terminated);
-                }
-            } else if (state_ == SipTransactionState::Completed) {
-                // Retransmission of the final response
-                // In a real implementation, we would keep the last response
-                // and retransmit it automatically
-            } else {
-                // Invalid state
-                core::Logger::warn("Server non-INVITE transaction {} sending response in invalid state {}",
-                              branch_, stateToString(state_));
-            }
-        }
-
-        // Emit send event
-        events_.emit("send", response);
-    } else {
-        // Client transactions don't send responses
-        core::Logger::error("Client transaction {} attempted to send response - ignoring", branch_);
-    }
-}
-
-bool SipTransaction::matches(const SipMessage& message) const {
-    if (message.getType() == SipMessageType::Request) {
-        // Request - check branch parameter in Via header
-        std::string via = message.getHeaders().getVia();
-        return via.find("branch=" + branch_) != std::string::npos &&
-               message.getMethod() == method_;
-    } else {
-        // Response - check branch parameter in Via header
-        std::string via = message.getHeaders().getVia();
-        return via.find("branch=" + branch_) != std::string::npos;
-    }
-}
-
-std::string SipTransaction::stateToString(SipTransactionState state) {
-    switch (state) {
-        case SipTransactionState::Trying:
-            return "Trying";
-        case SipTransactionState::Proceeding:
-            return "Proceeding";
-        case SipTransactionState::Completed:
-            return "Completed";
-        case SipTransactionState::Terminated:
-            return "Terminated";
-        default:
-            return "Unknown";
-    }
-}
-
-// SIP Transaction Manager implementation
-SipTransactionManager::SipTransactionManager() {}
-
-std::shared_ptr<SipTransaction> SipTransactionManager::createClientTransaction(const SipMessage& request) {
-    // Ekstrak branch dari Via header
-    std::string via = request.getHeaders().getVia();
-    std::string branch;
-
-    // Mencari parameter branch
-    size_t branch_pos = via.find("branch=");
-    if (branch_pos != std::string::npos) {
-        // Skip "branch="
-        branch_pos += 7;
-
-        // Find end of branch value (next semicolon or end of string)
-        size_t branch_end = via.find(';', branch_pos);
-        if (branch_end == std::string::npos) {
-            branch_end = via.length();
-        }
-
-        branch = via.substr(branch_pos, branch_end - branch_pos);
-    } else {
-        // Tidak ada branch parameter - tidak valid untuk RFC 3261
-        core::Logger::error("Request has no branch parameter in Via header");
-        throw SipError(SipErrorCode::InvalidMessage, "Missing branch parameter in Via header");
+        return true;
     }
 
-    // Buat transaction baru
-    auto transaction = std::make_shared<SipTransaction>(
-        SipTransactionType::Client,
-        branch,
-        request.getMethod()
-    );
-
-    // Simpan transaction
-    std::lock_guard<std::mutex> lock(mutex_);
-    transactions_[branch] = transaction;
-
-    // Send request
-    transaction->sendRequest(request);
-
-    return transaction;
+    return false;
 }
 
-std::shared_ptr<SipTransaction> SipTransactionManager::createServerTransaction(const SipMessage& request) {
-    // Ekstrak branch dari Via header
-    std::string via = request.getHeaders().getVia();
-    std::string branch;
+bool ServerNonInviteTransaction::sendMessage(const SipMessage& message) {
+    if (message.isResponse()) {
+        return sendResponse(message);
+    }
+    return false;
+}
 
-    // Mencari parameter branch
-    size_t branch_pos = via.find("branch=");
-    if (branch_pos != std::string::npos) {
-        // Skip "branch="
-        branch_pos += 7;
-
-        // Find end of branch value (next semicolon or end of string)
-        size_t branch_end = via.find(';', branch_pos);
-        if (branch_end == std::string::npos) {
-            branch_end = via.length();
-        }
-
-        branch = via.substr(branch_pos, branch_end - branch_pos);
-    } else {
-        // Tidak ada branch parameter - tidak valid untuk RFC 3261
-        core::Logger::error("Request has no branch parameter in Via header");
-        throw SipError(SipErrorCode::InvalidMessage, "Missing branch parameter in Via header");
+bool ServerNonInviteTransaction::canAcceptMessage(const SipMessage& message) const {
+    if (!message.isRequest()) {
+        return false;
     }
 
-    // Buat transaction baru
-    auto transaction = std::make_shared<SipTransaction>(
-        SipTransactionType::Server,
-        branch,
-        request.getMethod()
-    );
-
-    // Simpan transaction
-    std::lock_guard<std::mutex> lock(mutex_);
-    transactions_[branch] = transaction;
-
-    // Process request
-    transaction->processRequest(request);
-
-    return transaction;
+    // Check if request matches our transaction
+    return message.getHeaders().getCallId() == request_.getHeaders().getCallId() &&
+           message.getHeaders().getCSeq() == request_.getHeaders().getCSeq();
 }
 
-std::shared_ptr<SipTransaction> SipTransactionManager::findTransaction(const std::string& branch) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = transactions_.find(branch);
-    if (it != transactions_.end()) {
-        return it->second;
-    }
-    return nullptr;
-}
-
-std::shared_ptr<SipTransaction> SipTransactionManager::findTransaction(const SipMessage& message) {
-    std::string via = message.getHeaders().getVia();
-    std::string branch;
-
-    // Mencari parameter branch
-    size_t branch_pos = via.find("branch=");
-    if (branch_pos != std::string::npos) {
-        // Skip "branch="
-        branch_pos += 7;
-
-        // Find end of branch value (next semicolon or end of string)
-        size_t branch_end = via.find(';', branch_pos);
-        if (branch_end == std::string::npos) {
-            branch_end = via.length();
-        }
-
-        branch = via.substr(branch_pos, branch_end - branch_pos);
-    } else {
-        // Tidak ada branch parameter
-        return nullptr;
+bool ServerNonInviteTransaction::sendProvisionalResponse(SipResponseCode code, const std::string& reason) {
+    if (final_response_sent_) {
+        return false;
     }
 
-    return findTransaction(branch);
+    SipMessage response(code, reason.empty() ? "" : reason);
+    response.getHeaders().setCallId(request_.getHeaders().getCallId());
+    response.getHeaders().setFrom(request_.getHeaders().getFrom());
+    response.getHeaders().setTo(request_.getHeaders().getTo());
+    response.getHeaders().setCSeq(request_.getHeaders().getCSeq());
+    response.getHeaders().setVia(request_.getHeaders().getVia());
+
+    return sendResponse(response);
 }
 
-void SipTransactionManager::processMessage(const SipMessage& message) {
-    auto transaction = findTransaction(message);
+bool ServerNonInviteTransaction::sendFinalResponse(SipResponseCode code, const std::string& reason) {
+    SipMessage response(code, reason.empty() ? "" : reason);
+    response.getHeaders().setCallId(request_.getHeaders().getCallId());
+    response.getHeaders().setFrom(request_.getHeaders().getFrom());
+    response.getHeaders().setTo(request_.getHeaders().getTo());
+    response.getHeaders().setCSeq(request_.getHeaders().getCSeq());
+    response.getHeaders().setVia(request_.getHeaders().getVia());
 
-    if (transaction) {
-        if (message.getType() == SipMessageType::Request) {
-            transaction->processRequest(message);
-        } else {
-            transaction->processResponse(message);
-        }
-    } else if (message.getType() == SipMessageType::Request) {
-        // Ini adalah request yang tidak ada transaksinya - buat transaction baru
-        createServerTransaction(message);
-    } else {
-        // Ini adalah response yang tidak ada transaksinya - diabaikan
-        core::Logger::warn("Received response without matching transaction");
-    }
+    final_response_sent_ = true;
+    return sendResponse(response);
 }
 
-void SipTransactionManager::removeTransaction(const std::string& branch) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    transactions_.erase(branch);
-}
-
-void SipTransactionManager::cleanupTransactions() {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    auto now = std::chrono::steady_clock::now();
-    std::vector<std::string> to_remove;
-
-    for (const auto& [branch, transaction] : transactions_) {
-        if (transaction->isTerminated()) {
-            // Jika transaksi sudah terminated, hapus setelah 5 detik
-            auto timeout = std::chrono::seconds(5);
-            if (now - transaction->getLastActivity() > timeout) {
-                to_remove.push_back(branch);
-            }
-        } else if (!transaction->isInvite()) {
-            // Non-INVITE transactions timeout after 64*T1 = 32s
-            auto timeout = std::chrono::seconds(32);
-            if (now - transaction->getCreatedAt() > timeout) {
-                core::Logger::debug("Non-INVITE transaction {} timed out", branch);
-                transaction->setState(SipTransactionState::Terminated);
-                to_remove.push_back(branch);
-            }
-        } else if (transaction->isInvite() && transaction->getState() == SipTransactionState::Completed) {
-            // INVITE transactions in Completed state timeout after 64*T1 = 32s
-            auto timeout = std::chrono::seconds(32);
-            if (now - transaction->getLastActivity() > timeout) {
-                core::Logger::debug("INVITE transaction {} timed out in Completed state", branch);
-                transaction->setState(SipTransactionState::Terminated);
-                to_remove.push_back(branch);
-            }
-        }
+bool ServerNonInviteTransaction::sendResponse(const SipMessage& response) {
+    if (state_ == TransactionState::TRYING_NON_INVITE) {
+        setState(TransactionState::PROCEEDING_NON_INVITE);
     }
 
-    for (const auto& branch : to_remove) {
-        transactions_.erase(branch);
+    last_response_ = response;
+
+    SipResponseCode code = response.getResponseCode();
+    if (code >= SipResponseCode::OK) {
+        // Final response
+        final_response_sent_ = true;
+        setState(TransactionState::COMPLETED_NON_INVITE);
+        startTimerJ(); // Wait for retransmissions
     }
+
+    notifyMessage(response);
+    return true;
 }
 
-size_t SipTransactionManager::getTransactionCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return transactions_.size();
+void ServerNonInviteTransaction::startTimerJ() {
+    startTimer("TimerJ", std::chrono::seconds(32)); // 64*T1 = 32s for UDP, 0 for TCP
+}
+
+// TransactionIdGenerator implementation
+std::string TransactionIdGenerator::generateClientId(const SipMessage& request) {
+    // Client transaction ID = hash(Request-URI + Via + CSeq + Call-ID + From + To)
+    return hashMessage(request);
+}
+
+std::string TransactionIdGenerator::generateServerId(const SipMessage& request) {
+    // Server transaction ID = hash(Via + CSeq + Call-ID + From + To)
+    // Note: Request-URI is not included for server transactions
+    std::ostringstream oss;
+    oss << request.getHeaders().getVia()
+        << request.getHeaders().getCSeq()
+        << request.getHeaders().getCallId()
+        << request.getHeaders().getFrom()
+        << request.getHeaders().getTo();
+
+    return std::to_string(std::hash<std::string>{}(oss.str()));
+}
+
+std::string TransactionIdGenerator::generateBranch() {
+    // Generate RFC 3261 compliant branch parameter
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 15);
+
+    std::ostringstream oss;
+    oss << "z9hG4bK"; // Magic cookie for RFC 3261 compliance
+
+    // Add 8 random hex characters
+    for (int i = 0; i < 8; ++i) {
+        oss << std::hex << dis(gen);
+    }
+
+    return oss.str();
+}
+
+std::string TransactionIdGenerator::hashMessage(const SipMessage& message) {
+    std::ostringstream oss;
+
+    if (message.isRequest()) {
+        oss << message.getRequestUri().toString();
+    }
+
+    oss << message.getHeaders().getVia()
+        << message.getHeaders().getCSeq()
+        << message.getHeaders().getCallId()
+        << message.getHeaders().getFrom()
+        << message.getHeaders().getTo();
+
+    return std::to_string(std::hash<std::string>{}(oss.str()));
 }
 
 } // namespace fmus::sip

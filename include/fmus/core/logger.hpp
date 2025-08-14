@@ -1,180 +1,112 @@
 #pragma once
 
 #include <string>
-#include <string_view>
-#include <memory>
-#include <vector>
-#include <chrono>
-#include <mutex>
-#include <fstream>
-
-// Untuk C++20 features
-#if __has_include(<source_location>) && __cplusplus >= 202002L
-#include <source_location>
-#else
-#include <experimental/source_location>
-namespace std {
-    using source_location = experimental::source_location;
-}
-#endif
-
-#if __has_include(<format>) && __cplusplus >= 202002L
-#include <format>
-#else
+#include <iostream>
 #include <sstream>
+#include <mutex>
+#include <chrono>
 #include <iomanip>
-#endif
 
 namespace fmus::core {
 
-// Tingkat log yang tersedia
 enum class LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warning,
-    Error,
-    Fatal
+    DEBUG = 0,
+    INFO = 1,
+    WARN = 2,
+    ERROR = 3
 };
 
-// Format pesan log
-struct LogMessage {
-    LogLevel level;
-    std::string message;  // Changed from string_view to string for lifetime management
-    std::source_location location;
-    std::chrono::system_clock::time_point timestamp;
-};
-
-// Interface untuk sink log
-class ILogSink {
-public:
-    virtual ~ILogSink() = default;
-    virtual void write(const LogMessage& msg) = 0;
-};
-
-// Sink untuk console output
-class ConsoleSink : public ILogSink {
-public:
-    void write(const LogMessage& msg) override;
-};
-
-// Sink untuk file output
-class FileSink : public ILogSink {
-public:
-    explicit FileSink(const std::string& filename);
-    void write(const LogMessage& msg) override;
-
-private:
-    std::ofstream file_;
-    std::mutex mutex_;
-};
-
-// Helper untuk format string jika std::format tidak tersedia
-#if !(__has_include(<format>) && __cplusplus >= 202002L)
-namespace detail {
-    template<typename... Args>
-    std::string format_string(const std::string_view& fmt, Args&&... args) {
-        std::ostringstream oss;
-        size_t pos = 0;
-        size_t arg_idx = 0;
-        ((void)[&] {
-            size_t next = fmt.find("{}", pos);
-            if (next != std::string::npos) {
-                oss << fmt.substr(pos, next - pos);
-                oss << args;
-                pos = next + 2;
-            }
-        }(), ...);
-        oss << fmt.substr(pos);
-        return oss.str();
-    }
-}
-#endif
-
-// Logger utama
 class Logger {
 public:
-    static Logger& instance();
-
-    // Mencegah copy dan move
-    Logger(const Logger&) = delete;
-    Logger& operator=(const Logger&) = delete;
-    Logger(Logger&&) = delete;
-    Logger& operator=(Logger&&) = delete;
-
-    // Menambah sink baru
-    void addSink(std::shared_ptr<ILogSink> sink);
-
-    // Set minimum log level
-    void setLevel(LogLevel level);
-
-    // Fungsi logging utama
+    static void setLevel(LogLevel level);
+    static LogLevel getLevel();
+    
     template<typename... Args>
-    void log(LogLevel level,
-             std::string_view format,
-             Args&&... args,
-             const std::source_location& location = std::source_location::current()) {
-        if (level < minimumLevel_) return;
-
-        LogMessage msg{
-            .level = level,
-#if __has_include(<format>) && __cplusplus >= 202002L
-            .message = std::format(format, std::forward<Args>(args)...),
-#else
-            .message = detail::format_string(format, std::forward<Args>(args)...),
-#endif
-            .location = location,
-            .timestamp = std::chrono::system_clock::now()
-        };
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& sink : sinks_) {
-            sink->write(msg);
-        }
+    static void debug(const std::string& format, Args&&... args) {
+        log(LogLevel::DEBUG, format, std::forward<Args>(args)...);
     }
-
-    // Helper functions
+    
     template<typename... Args>
-    void trace(std::string_view format, Args&&... args) {
-        log(LogLevel::Trace, format, std::forward<Args>(args)...);
+    static void info(const std::string& format, Args&&... args) {
+        log(LogLevel::INFO, format, std::forward<Args>(args)...);
     }
-
+    
     template<typename... Args>
-    void debug(std::string_view format, Args&&... args) {
-        log(LogLevel::Debug, format, std::forward<Args>(args)...);
+    static void warn(const std::string& format, Args&&... args) {
+        log(LogLevel::WARN, format, std::forward<Args>(args)...);
     }
-
+    
     template<typename... Args>
-    void info(std::string_view format, Args&&... args) {
-        log(LogLevel::Info, format, std::forward<Args>(args)...);
-    }
-
-    template<typename... Args>
-    void warning(std::string_view format, Args&&... args) {
-        log(LogLevel::Warning, format, std::forward<Args>(args)...);
-    }
-
-    template<typename... Args>
-    void error(std::string_view format, Args&&... args) {
-        log(LogLevel::Error, format, std::forward<Args>(args)...);
-    }
-
-    template<typename... Args>
-    void fatal(std::string_view format, Args&&... args) {
-        log(LogLevel::Fatal, format, std::forward<Args>(args)...);
+    static void error(const std::string& format, Args&&... args) {
+        log(LogLevel::ERROR, format, std::forward<Args>(args)...);
     }
 
 private:
-    Logger() = default;
-
-    std::vector<std::shared_ptr<ILogSink>> sinks_;
-    LogLevel minimumLevel_ = LogLevel::Info;
-    std::mutex mutex_;
+    static LogLevel current_level_;
+    static std::mutex mutex_;
+    
+    template<typename... Args>
+    static void log(LogLevel level, const std::string& format, Args&&... args) {
+        if (level < current_level_) return;
+        
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        // Get current time
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()) % 1000;
+        
+        // Format timestamp
+        std::ostringstream oss;
+        oss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+        oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+        
+        // Format level
+        const char* level_str = "";
+        switch (level) {
+            case LogLevel::DEBUG: level_str = "DEBUG"; break;
+            case LogLevel::INFO:  level_str = "INFO "; break;
+            case LogLevel::WARN:  level_str = "WARN "; break;
+            case LogLevel::ERROR: level_str = "ERROR"; break;
+        }
+        
+        // Simple format string replacement (basic implementation)
+        std::string message = formatString(format, std::forward<Args>(args)...);
+        
+        std::cout << "[" << oss.str() << "] [" << level_str << "] " << message << std::endl;
+    }
+    
+    // Simple format string implementation
+    template<typename T>
+    static std::string formatString(const std::string& format, T&& value) {
+        size_t pos = format.find("{}");
+        if (pos != std::string::npos) {
+            std::ostringstream oss;
+            oss << value;
+            std::string result = format;
+            result.replace(pos, 2, oss.str());
+            return result;
+        }
+        return format;
+    }
+    
+    template<typename T, typename... Args>
+    static std::string formatString(const std::string& format, T&& value, Args&&... args) {
+        size_t pos = format.find("{}");
+        if (pos != std::string::npos) {
+            std::ostringstream oss;
+            oss << value;
+            std::string partial = format;
+            partial.replace(pos, 2, oss.str());
+            return formatString(partial, std::forward<Args>(args)...);
+        }
+        return format;
+    }
+    
+    static std::string formatString(const std::string& format) {
+        return format;
+    }
 };
-
-// Global logger instance
-inline Logger& logger() {
-    return Logger::instance();
-}
 
 } // namespace fmus::core

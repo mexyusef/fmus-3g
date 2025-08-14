@@ -203,4 +203,4 @@ compile_commands.json
 *.swp
 *.swo
 *~
-
+/_legacy/

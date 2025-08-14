@@ -1,12 +1,11 @@
-set(RTP_SOURCES
+add_library(fmus-rtp
     packet.cpp
-    session.cpp
-    transport.cpp
 )
 
-target_sources(fmus_lib PRIVATE ${RTP_SOURCES})
+target_include_directories(fmus-rtp PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
 
-# Add tests
-if(BUILD_TESTS)
-    add_subdirectory(../../tests/rtp ${CMAKE_BINARY_DIR}/tests/rtp)
-endif()
+target_link_libraries(fmus-rtp
+    fmus-core
+)
